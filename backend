@@ -1,0 +1,197 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
+const xml2js = require('xml2js');
+
+const app = express();
+app.use(cors());
+
+// Middleware для парсинга XML
+app.use(express.text({ type: 'application/xml' }));
+app.use(express.json()); // для JSON
+
+const db = new sqlite3.Database('./resume_system.db');
+
+// Парсер XML
+const xmlParser = new xml2js.Parser();
+const xmlBuilder = new xml2js.Builder();
+
+// 📤 Endpoint для ЭКСПОРТА данных в XML
+app.get('/candidates/xml', (req, res) => {
+    const sql = `
+        SELECT c.*, 
+               GROUP_CONCAT(s.name) as skills
+        FROM candidates c
+        LEFT JOIN candidate_skills cs ON c.id = cs.candidate_id
+        LEFT JOIN skills s ON cs.skill_id = s.id
+        GROUP BY c.id
+    `;
+    
+    db.all(sql, [], (err, rows) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+        
+        // Формируем XML структуру
+        const xmlObject = {
+            resumes: {
+                candidate: rows.map(candidate => ({
+                    id: candidate.id,
+                    name: candidate.name,
+                    email: candidate.email,
+                    experience: candidate.experience,
+                    skills: candidate.skills ? {
+                        skill: candidate.skills.split(',').map(s => s.trim())
+                    } : {}
+                }))
+            }
+        };
+        
+        // Конвертируем в XML
+        const xml = xmlBuilder.buildObject(xmlObject);
+        
+        // Отправляем как XML
+        res.set('Content-Type', 'application/xml');
+        res.send(xml);
+    });
+});
+
+// 📥 Endpoint для ИМПОРТА данных из XML
+app.post('/candidates/import-xml', (req, res) => {
+    const xmlData = req.body;
+    
+    xmlParser.parseString(xmlData, (err, result) => {
+        if (err) {
+            res.status(400).json({ error: 'Невалидный XML' });
+            return;
+        }
+        
+        try {
+            const candidates = result.resumes.candidate;
+            let importedCount = 0;
+            
+            // Обрабатываем каждого кандидата из XML
+            candidates.forEach(candidateData => {
+                const candidate = candidateData;
+                
+                const sql = `INSERT INTO candidates (name, email, experience) VALUES (?, ?, ?)`;
+                const params = [
+                    candidate.name[0],
+                    candidate.email[0],
+                    candidate.experience[0] || 0
+                ];
+                
+                db.run(sql, params, function(err) {
+                    if (err) {
+                        console.error('Ошибка добавления:', err);
+                    } else {
+                        importedCount++;
+                        
+                        // Добавляем навыки если они есть
+                        if (candidate.skills && candidate.skills[0].skill) {
+                            const skills = candidate.skills[0].skill;
+                            const candidateId = this.lastID;
+                            
+                            skills.forEach(skillName => {
+                                // Сначала находим или создаем навык
+                                db.get(
+                                    "SELECT id FROM skills WHERE name = ?", 
+                                    [skillName], 
+                                    (err, skillRow) => {
+                                        if (skillRow) {
+                                            // Связываем кандидата с навыком
+                                            db.run(
+                                                "INSERT INTO candidate_skills (candidate_id, skill_id) VALUES (?, ?)",
+                                                [candidateId, skillRow.id]
+                                            );
+                                        }
+                                    }
+                                );
+                            });
+                        }
+                    }
+                });
+            });
+            
+            res.json({ 
+                message: `Импортировано ${importedCount} кандидатов из XML` 
+            });
+            
+        } catch (error) {
+            res.status(500).json({ error: 'Ошибка обработки XML' });
+        }
+    });
+});
+
+// 📤 Endpoint для получения данных в XML или JSON (по заголовку)
+app.get('/candidates', (req, res) => {
+    const acceptHeader = req.headers.accept;
+    const format = req.query.format; // или через query параметр
+    
+    const sql = `SELECT * FROM candidates`;
+    
+    db.all(sql, [], (err, rows) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+        
+        // Если клиент запрашивает XML
+        if (acceptHeader.includes('application/xml') || format === 'xml') {
+            const xmlObject = {
+                candidates: {
+                    candidate: rows
+                }
+            };
+            const xml = xmlBuilder.buildObject(xmlObject);
+            res.set('Content-Type', 'application/xml');
+            res.send(xml);
+        } else {
+            // По умолчанию JSON
+            res.json({ data: rows });
+        }
+    });
+});
+
+// 📥 Универсальный endpoint (принимает и JSON и XML)
+app.post('/candidates', (req, res) => {
+    let candidateData;
+    
+    // Определяем тип контента
+    const contentType = req.headers['content-type'];
+    
+    if (contentType.includes('application/xml')) {
+        // Парсим XML
+        xmlParser.parseString(req.body, (err, result) => {
+            if (err) {
+                res.status(400).json({ error: 'Невалидный XML' });
+                return;
+            }
+            candidateData = result.candidate;
+        });
+    } else {
+        // Используем JSON
+        candidateData = req.body;
+    }
+    
+    const { name, email, experience } = candidateData;
+    
+    const sql = `INSERT INTO candidates (name, email, experience) VALUES (?, ?, ?)`;
+    const params = [name, email, experience || 0];
+    
+    db.run(sql, params, function(err) {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+        res.json({
+            message: "Кандидат добавлен",
+            data: { id: this.lastID, name, email, experience }
+        });
+    });
+});
+
+app.listen(3000, () => {
+    console.log('🚀 Сервер с XML поддержкой запущен на порту 3000');
+});
